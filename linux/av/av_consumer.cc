@@ -51,7 +51,7 @@ struct AVConsumer::Impl {
 				std::memcpy(&payload, buffer + sizeof(uint64_t), sizeof(uint32_t));
 				const uint8_t* h264 = buffer + header;
 				const size_t h264_size = size - header;
-				std::cout << "[AVConsumer] Video timestamp=" << ts << ", payloadSize=" << payload << std::endl;
+				//std::cout << "[AVConsumer] Video timestamp=" << ts << ", payloadSize=" << payload << std::endl;
 
 				// Decode to YUV420P and store
 				int w=0,h=0; std::vector<uint8_t> yuv;
@@ -61,7 +61,7 @@ struct AVConsumer::Impl {
 					lastH = h;
 					lastYuv420p = std::move(yuv);
 					newFrameAvailable = true;
-					std::cout << "[AVConsumer] Decoded frame " << w << "x" << h << " (YUV420P)\n";
+					//std::cout << "[AVConsumer] Decoded frame " << w << "x" << h << " (YUV420P)\n";
 				}
 			},
 			10);
@@ -78,7 +78,7 @@ struct AVConsumer::Impl {
 				uint32_t payload = 0;
 				std::memcpy(&ts, buffer, sizeof(uint64_t));
 				std::memcpy(&payload, buffer + sizeof(uint64_t), sizeof(uint32_t));
-				std::cout << "[AVConsumer] Audio timestamp=" << ts << ", payloadSize=" << payload << std::endl;
+				//std::cout << "[AVConsumer] Audio timestamp=" << ts << ", payloadSize=" << payload << std::endl;
 			},
 			10);
 

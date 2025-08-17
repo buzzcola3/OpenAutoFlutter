@@ -5,6 +5,9 @@
 #include <string.h>
 #include <mutex>
 #include <string>
+#include <stdlib.h>
+#include <stdio.h>
+#include <vector>
 
 
 struct _OAVideoTexture {
@@ -26,11 +29,19 @@ struct _OAVideoTexture {
 	GLuint fbo = 0;                         // framebuffer to render into gl_tex
 	GLuint program = 0;                     // YUV->RGBA shader program
 	GLuint vbo = 0;                         // full-screen quad VBO
+	GLuint vao = 0;                         // vertex array object (core profile)
 	GLint loc_aPos = -1, loc_aTex = -1;
 	GLint loc_texY = -1, loc_texU = -1, loc_texV = -1;
+	GLint loc_dbgMode = -1;                 // debug mode uniform
 	int64_t registered_id = 0;    // Flutter texture id once registered
 
 	std::mutex mutex; // protects pixels/width/height
+
+	// Debug: dump next composed RGBA frame to file when TRUE
+	gboolean dump_next_frame = FALSE;
+
+	// Debug: shader mode: 0=RGB, 1=show Y, 2=show U, 3=show V
+	int dbg_mode = 0;
 };
 
 struct _OAVideoTextureClass {
@@ -48,7 +59,8 @@ static GLuint compile_shader(GLenum type, const char* src) {
 }
 
 static GLuint create_yuv_program(GLint& loc_aPos, GLint& loc_aTex,
-								 GLint& loc_texY, GLint& loc_texU, GLint& loc_texV) {
+								 GLint& loc_texY, GLint& loc_texU, GLint& loc_texV,
+								 GLint& loc_dbgMode) {
 	// GLSL 120 for desktop OpenGL compatibility
 	static const char* vsrc =
 		"#version 120\n"
@@ -62,10 +74,17 @@ static GLuint create_yuv_program(GLint& loc_aPos, GLint& loc_aTex,
 		"uniform sampler2D texY;\n"
 		"uniform sampler2D texU;\n"
 		"uniform sampler2D texV;\n"
+		"uniform int dbgMode;\n"
 		"void main(){\n"
-		"  float y = texture2D(texY, vTex).r;\n"
-		"  float u = texture2D(texU, vTex).r - 0.5;\n"
-		"  float v = texture2D(texV, vTex).r - 0.5;\n"
+		"  float yRaw = texture2D(texY, vTex).r;\n"
+		"  float uRaw = texture2D(texU, vTex).r;\n"
+		"  float vRaw = texture2D(texV, vTex).r;\n"
+		"  float y = yRaw;\n"
+		"  float u = uRaw - 0.5;\n"
+		"  float v = vRaw - 0.5;\n"
+		"  if (dbgMode == 1) { gl_FragColor = vec4(y, y, y, 1.0); return; }\n"
+		"  if (dbgMode == 2) { gl_FragColor = vec4(uRaw, uRaw, uRaw, 1.0); return; }\n"
+		"  if (dbgMode == 3) { gl_FragColor = vec4(vRaw, vRaw, vRaw, 1.0); return; }\n"
 		"  float r = y + 1.402 * v;\n"
 		"  float g = y - 0.344136 * u - 0.714136 * v;\n"
 		"  float b = y + 1.772 * u;\n"
@@ -85,6 +104,7 @@ static GLuint create_yuv_program(GLint& loc_aPos, GLint& loc_aTex,
 	loc_texY  = glGetUniformLocation(prog, "texY");
 	loc_texU  = glGetUniformLocation(prog, "texU");
 	loc_texV  = glGetUniformLocation(prog, "texV");
+	loc_dbgMode = glGetUniformLocation(prog, "dbgMode");
 	return prog;
 }
 
@@ -95,6 +115,8 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 							uint32_t* height,
 							GError** error) {
 	OAVideoTexture* self = (OAVideoTexture*)texture;
+
+	g_print("Populating OAVideoTexture\n");
 
 	if (self->gl_tex == 0) {
 		glGenTextures(1, &self->gl_tex);
@@ -121,7 +143,12 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 	if (have_yuv) {
 		// Lazy-init GL resources
 		if (self->program == 0) {
-			self->program = create_yuv_program(self->loc_aPos, self->loc_aTex, self->loc_texY, self->loc_texU, self->loc_texV);
+			self->program = create_yuv_program(self->loc_aPos, self->loc_aTex, self->loc_texY, self->loc_texU, self->loc_texV, self->loc_dbgMode);
+			const char* env_dbg = getenv("OA_YUV_DBG");
+			if (env_dbg) {
+				int m = atoi(env_dbg);
+				if (m >= 0 && m <= 3) self->dbg_mode = m;
+			}
 		}
 		if (self->vbo == 0) {
 			const GLfloat quad[] = {
@@ -159,24 +186,24 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
 		// Upload planes as single-channel textures (GL_LUMINANCE for broad compat)
-		glBindTexture(GL_TEXTURE_2D, self->y_tex);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, cur_w, cur_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_ptr);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glBindTexture(GL_TEXTURE_2D, self->y_tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, cur_w, cur_h, 0, GL_RED, GL_UNSIGNED_BYTE, y_ptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-		glBindTexture(GL_TEXTURE_2D, self->u_tex);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_w, uv_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_ptr);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glBindTexture(GL_TEXTURE_2D, self->u_tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_w, uv_h, 0, GL_RED, GL_UNSIGNED_BYTE, u_ptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-		glBindTexture(GL_TEXTURE_2D, self->v_tex);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_w, uv_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_ptr);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glBindTexture(GL_TEXTURE_2D, self->v_tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_w, uv_h, 0, GL_RED, GL_UNSIGNED_BYTE, v_ptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -196,6 +223,11 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 		glBindTexture(GL_TEXTURE_2D, self->v_tex);
 		glUniform1i(self->loc_texV, 2);
 
+		// Set debug mode (0=RGB, 1=Y, 2=U, 3=V)
+		if (self->loc_dbgMode >= 0) {
+			glUniform1i(self->loc_dbgMode, self->dbg_mode);
+		}
+
 		glBindBuffer(GL_ARRAY_BUFFER, self->vbo);
 		glEnableVertexAttribArray(self->loc_aPos);
 		glVertexAttribPointer(self->loc_aPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)0);
@@ -203,6 +235,45 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 		glVertexAttribPointer(self->loc_aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)(2 * sizeof(GLfloat)));
 
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+		// Optional debug dump: write raw YUV420P and read back RGBA to PPM.
+		if (self->dump_next_frame) {
+			// Dump YUV buffer as planar Y [W*H], U [W/2*H/2], V [W/2*H/2]
+			const int y_size = cur_w * cur_h;
+			const int uv_w = (cur_w + 1) / 2;
+			const int uv_h = (cur_h + 1) / 2;
+			const int uv_size = uv_w * uv_h;
+			const size_t total_yuv = (size_t)y_size + 2u * (size_t)uv_size;
+			if (self->yuv && (size_t)self->yuv->len >= total_yuv) {
+				FILE* yuv_fp = fopen("/tmp/oa_last_frame.yuv", "wb");
+				if (yuv_fp) {
+					fwrite(self->yuv->data, 1, total_yuv, yuv_fp);
+					fclose(yuv_fp);
+				}
+			}
+
+			// Read back RGBA from FBO and write PPM (P6) without alpha
+			const size_t rgba_bytes = (size_t)cur_w * (size_t)cur_h * 4u;
+			std::vector<unsigned char> rgba(rgba_bytes);
+			glReadPixels(0, 0, cur_w, cur_h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+			FILE* fp = fopen("/tmp/oa_last_frame.ppm", "wb");
+			if (fp) {
+				fprintf(fp, "P6\n%d %d\n255\n", cur_w, cur_h);
+				std::vector<unsigned char> rgb((size_t)cur_w * (size_t)cur_h * 3u);
+				for (int y = 0; y < cur_h; ++y) {
+					const unsigned char* src = rgba.data() + (size_t)y * (size_t)cur_w * 4u;
+					unsigned char* dst = rgb.data() + (size_t)y * (size_t)cur_w * 3u;
+					for (int x = 0; x < cur_w; ++x) {
+						dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+						src += 4; dst += 3;
+					}
+				}
+				fwrite(rgb.data(), 1, rgb.size(), fp);
+				fclose(fp);
+			}
+
+			self->dump_next_frame = FALSE;
+		}
 
 		// Cleanup state
 		glDisableVertexAttribArray(self->loc_aPos);
@@ -224,6 +295,33 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 					 GL_RGBA,
 					 GL_UNSIGNED_BYTE,
 					 self->pixels->data);
+
+		// Optional debug dump for RGBA path: attach texture to FBO and read back
+		if (self->dump_next_frame) {
+			if (self->fbo == 0) glGenFramebuffers(1, &self->fbo);
+			glBindFramebuffer(GL_FRAMEBUFFER, self->fbo);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self->gl_tex, 0);
+			const size_t rgba_bytes = (size_t)cur_w * (size_t)cur_h * 4u;
+			std::vector<unsigned char> rgba(rgba_bytes);
+			glReadPixels(0, 0, cur_w, cur_h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			FILE* fp = fopen("/tmp/oa_last_frame.ppm", "wb");
+			if (fp) {
+				fprintf(fp, "P6\n%d %d\n255\n", cur_w, cur_h);
+				std::vector<unsigned char> rgb((size_t)cur_w * (size_t)cur_h * 3u);
+				for (int y = 0; y < cur_h; ++y) {
+					const unsigned char* src = rgba.data() + (size_t)y * (size_t)cur_w * 4u;
+					unsigned char* dst = rgb.data() + (size_t)y * (size_t)cur_w * 3u;
+					for (int x = 0; x < cur_w; ++x) {
+						dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+						src += 4; dst += 3;
+					}
+				}
+				fwrite(rgb.data(), 1, rgb.size(), fp);
+				fclose(fp);
+			}
+			self->dump_next_frame = FALSE;
+		}
 		*width = (uint32_t)cur_w;
 		*height = (uint32_t)cur_h;
 		lk.unlock();
@@ -314,6 +412,7 @@ void oa_video_texture_set_frame(OAVideoTexture* self,
 		memcpy(self->pixels->data, rgba_bytes, needed);
 	}
 	self->has_yuv = FALSE;
+	self->dump_next_frame = TRUE; // debug: dump next composed frame
 }
 
 void oa_video_texture_set_yuv420p_frame(OAVideoTexture* self,
@@ -340,6 +439,7 @@ void oa_video_texture_set_yuv420p_frame(OAVideoTexture* self,
 	} else {
 		self->has_yuv = FALSE;
 	}
+	self->dump_next_frame = TRUE; // debug: dump next composed frame
 }
 
 void oa_video_texture_mark_frame_available(OAVideoTexture* self,
