@@ -1,6 +1,8 @@
 #include "include/openautoflutter/openautoflutter_plugin.h"
 #include "av/oa_video_texture.h"
-#include "av/av_consumer.h"
+#include "av/h264_decoder.h"
+#include "transport.hpp"
+#include "wire.hpp"
 #include <flutter_linux/flutter_linux.h>
 #include <gtk/gtk.h>
 #include <glib-object.h>
@@ -8,6 +10,12 @@
 #include <sys/utsname.h>
 
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+using OATransport = buzz::autoapp::Transport::Transport;
+using OAMsgType = buzz::wire::MsgType;
 
 #include "openautoflutter_plugin_private.h"
 
@@ -19,7 +27,13 @@ struct _OpenautoflutterPlugin {
   GObject parent_instance;
   OAVideoTexture* video_texture;
   int64_t texture_id;
-  AVConsumer* av_consumer; // runs background SHM consumers
+  std::unique_ptr<OATransport> transport; // OpenAutoTransport receiver
+  H264Decoder decoder;
+  std::mutex frame_mutex;
+  std::vector<uint8_t> last_yuv;
+  int frame_w;
+  int frame_h;
+  bool new_frame;
   FlTextureRegistrar* texture_registrar; // to mark frames available
   guint frame_timer_id; // periodic pump for decoded frames
 };
@@ -64,8 +78,10 @@ static void openautoflutter_plugin_dispose(GObject* object) {
   if (self->video_texture != nullptr) {
     g_clear_object(&self->video_texture);
   }
-  // Intentionally do not delete av_consumer here: its threads block on semaphores
-  // and we don't have a stop signal. Let the process teardown reclaim it.
+  if (self->transport) {
+    self->transport->stop();
+    self->transport.reset();
+  }
   G_OBJECT_CLASS(openautoflutter_plugin_parent_class)->dispose(object);
 }
 
@@ -76,10 +92,36 @@ static void openautoflutter_plugin_class_init(OpenautoflutterPluginClass* klass)
 static void openautoflutter_plugin_init(OpenautoflutterPlugin* self) {
   self->video_texture = nullptr;
   self->texture_id = 0;
-  self->av_consumer = new AVConsumer();
-  self->av_consumer->start();
+  self->transport = std::make_unique<OATransport>();
+  self->frame_w = 0;
+  self->frame_h = 0;
+  self->new_frame = false;
   self->texture_registrar = nullptr;
   self->frame_timer_id = 0;
+
+  // Start as Side B (joiner) with default OAT settings (5s wait, 1ms poll inside OAT).
+  g_message("OAT: starting transport as Side B (default settings)");
+  if (!self->transport->startAsB(std::chrono::milliseconds{5000})) {
+    g_warning("OAT: startAsB failed");
+  } else {
+    g_message("OAT: transport started (side=%d, running=%d)", static_cast<int>(self->transport->side()),
+              self->transport->isRunning() ? 1 : 0);
+    // Register handler for VIDEO messages: decode H264 to YUV420P and store.
+    self->transport->addTypeHandler(static_cast<OAMsgType>(OAMsgType::VIDEO),
+      [self](uint64_t /*ts*/, const void* data, std::size_t size) {
+        if (!data || size == 0) return;
+        g_message("OAT VIDEO packet: %zu bytes", size);
+        const auto* h264 = static_cast<const uint8_t*>(data);
+        int w = 0, h = 0; std::vector<uint8_t> yuv;
+        if (self->decoder.decode_to_yuv420p(h264, size, yuv, w, h)) {
+          std::lock_guard<std::mutex> lk(self->frame_mutex);
+          self->frame_w = w;
+          self->frame_h = h;
+          self->last_yuv.swap(yuv);
+          self->new_frame = true;
+        }
+      });
+  }
 }
 
 static void method_call_cb(FlMethodChannel* channel, FlMethodCall* method_call,
@@ -91,16 +133,23 @@ static void method_call_cb(FlMethodChannel* channel, FlMethodCall* method_call,
 // Periodically pump decoded frames from AVConsumer into the Flutter texture.
 static gboolean pump_video_frame_cb(gpointer user_data) {
   OpenautoflutterPlugin* self = OPENAUTOFLUTTER_PLUGIN(user_data);
-  if (!self || !self->av_consumer || !self->video_texture || !self->texture_registrar) {
+  if (!self || !self->video_texture || !self->texture_registrar) {
     return TRUE; // keep the timer; environment not ready yet
   }
-  if (self->av_consumer->is_new_frame_available()) {
-    const uint8_t* data = nullptr; int w = 0; int h = 0; size_t size = 0;
-    if (self->av_consumer->get_last_yuv420p(data, w, h, size) && data && size > 0) {
-      oa_video_texture_set_yuv420p_frame(self->video_texture, reinterpret_cast<const guint8*>(data), (gsize)size, w, h);
-      oa_video_texture_mark_frame_available(self->video_texture, self->texture_registrar);
+  {
+    std::lock_guard<std::mutex> lk(self->frame_mutex);
+    if (self->new_frame && !self->last_yuv.empty() && self->frame_w > 0 && self->frame_h > 0) {
+      const gsize need = static_cast<gsize>(self->frame_w) * static_cast<gsize>(self->frame_h) * 3u / 2u;
+      if (self->last_yuv.size() >= need) {
+        oa_video_texture_set_yuv420p_frame(self->video_texture,
+                                           reinterpret_cast<const guint8*>(self->last_yuv.data()),
+                                           static_cast<gsize>(self->last_yuv.size()),
+                                           self->frame_w,
+                                           self->frame_h);
+        oa_video_texture_mark_frame_available(self->video_texture, self->texture_registrar);
+      }
+      self->new_frame = false;
     }
-    self->av_consumer->mark_frame_consumed();
   }
   return TRUE; // continue calling
 }

@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "flutter build linux (example)",
+      "type": "shell",
+      "command": "flutter",
+      "args": ["build", "linux", "-v"],
+      "options": {
+        "cwd": "${workspaceFolder}/example"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "flutter clean (example)",
+      "type": "shell",
+      "command": "flutter",
+      "args": ["clean"],
+      "options": {
+        "cwd": "${workspaceFolder}/example"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flutter: Debug example (Linux)",
+      "request": "launch",
+      "type": "dart",
+      "program": "${workspaceFolder}/example/lib/main.dart",
+      "cwd": "${workspaceFolder}/example",
+      "deviceId": "linux",
+      "flutterMode": "debug"
+    },
+    {
+      "name": "Flutter: Profile example (Linux)",
+      "request": "launch",
+      "type": "dart",
+      "program": "${workspaceFolder}/example/lib/main.dart",
+      "cwd": "${workspaceFolder}/example",
+      "deviceId": "linux",
+      "flutterMode": "profile"
+    }
+  ]
+}

@@ -1,5 +1,8 @@
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.13)
+# Use clang toolchain to match prebuilt OpenAutoTransport (libc++ ABI).
+set(CMAKE_C_COMPILER "/usr/bin/clang")
+set(CMAKE_CXX_COMPILER "/usr/bin/clang++")
 project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change

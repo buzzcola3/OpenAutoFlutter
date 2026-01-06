@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <stdexcept>
+#include <cstring>
+#include <mutex>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -15,6 +17,10 @@ struct H264Decoder::Impl {
 	AVFrame* frame = nullptr;
 	AVPacket* pkt = nullptr;
 	SwsContext* sws = nullptr;
+	std::mutex mutex;
+	int sws_w = 0;
+	int sws_h = 0;
+	AVPixelFormat sws_fmt = AV_PIX_FMT_NONE;
 
 	Impl() {
 		codec = avcodec_find_decoder(AV_CODEC_ID_H264);
@@ -44,29 +50,52 @@ bool H264Decoder::decode_to_yuv420p(const uint8_t* data,
 									std::vector<uint8_t>& out_yuv,
 									int& out_width,
 									int& out_height) {
+	if (!data || size == 0) return false;
+	if (size < 32 || size > 4 * 1024 * 1024) return false; // guard malformed payloads
+	bool has_start_code = (size >= 4 && data[0] == 0 && data[1] == 0 && ((data[2] == 0 && data[3] == 1) || data[2] == 1));
+	if (!has_start_code) return false; // skip non-Annex B payloads to avoid decoder crashes
 	auto* impl = impl_;
+	std::lock_guard<std::mutex> lock(impl->mutex);
 	av_packet_unref(impl->pkt);
-	impl->pkt->data = const_cast<uint8_t*>(data);
-	impl->pkt->size = static_cast<int>(size);
+	if (av_new_packet(impl->pkt, static_cast<int>(size)) < 0) return false;
+	std::memcpy(impl->pkt->data, data, size);
 
 	int ret = avcodec_send_packet(impl->ctx, impl->pkt);
-	if (ret < 0) return false;
+	if (ret < 0) {
+		avcodec_flush_buffers(impl->ctx);
+		return false;
+	}
 
 	while (true) {
 		ret = avcodec_receive_frame(impl->ctx, impl->frame);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-		if (ret < 0) return false;
+		if (ret < 0) {
+			avcodec_flush_buffers(impl->ctx);
+			return false;
+		}
 
 		AVFrame* f = impl->frame;
 		out_width = f->width;
 		out_height = f->height;
-		if (out_width <= 0 || out_height <= 0) return false;
+		if (out_width <= 0 || out_height <= 0) {
+			av_frame_unref(impl->frame);
+			return false;
+		}
+		if (out_width > 8192 || out_height > 4320) return false; // guard against corrupted sizes
+		if (!f->data[0] || !f->data[1] || !f->data[2]) return false;
+		if (f->linesize[0] <= 0 || f->linesize[1] <= 0 || f->linesize[2] <= 0) return false;
 
-		SwsContext* sws = sws_getContext(
-			f->width, f->height, static_cast<AVPixelFormat>(f->format),
-			f->width, f->height, AV_PIX_FMT_YUV420P,
-			SWS_BILINEAR, nullptr, nullptr, nullptr);
-		if (!sws) return false;
+		if (!impl->sws || impl->sws_w != out_width || impl->sws_h != out_height || impl->sws_fmt != static_cast<AVPixelFormat>(f->format)) {
+			if (impl->sws) sws_freeContext(impl->sws);
+			impl->sws = sws_getContext(
+				f->width, f->height, static_cast<AVPixelFormat>(f->format),
+				f->width, f->height, AV_PIX_FMT_YUV420P,
+				SWS_BILINEAR, nullptr, nullptr, nullptr);
+			impl->sws_w = out_width;
+			impl->sws_h = out_height;
+			impl->sws_fmt = static_cast<AVPixelFormat>(f->format);
+		}
+		if (!impl->sws) return false;
 
 		const int y_size = out_width * out_height;
 		const int uv_w = (out_width + 1) / 2;
@@ -87,8 +116,8 @@ bool H264Decoder::decode_to_yuv420p(const uint8_t* data,
 			0
 		};
 
-		sws_scale(sws, f->data, f->linesize, 0, out_height, dst_data, dst_linesize);
-		sws_freeContext(sws);
+		sws_scale(impl->sws, f->data, f->linesize, 0, out_height, dst_data, dst_linesize);
+		av_frame_unref(impl->frame);
 		return true;
 	}
 	return false;

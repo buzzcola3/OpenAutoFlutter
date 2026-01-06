@@ -60,23 +60,29 @@ class _MyAppState extends State<MyApp> {
           title: const Text('Plugin example app'),
         ),
         body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Text('Running on: $_platformVersion'),
-              const SizedBox(height: 12),
-              if (_videoTextureId == null)
-                const Text('Texture not available')
-              else ...[
-                Text('Texture ID: $_videoTextureId'),
-                const SizedBox(height: 8),
-                // Render the native GL video texture.
-                AspectRatio(
-                  aspectRatio: 16 / 9,
-                  child: Texture(textureId: _videoTextureId!),
-                ),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Text('Running on: $_platformVersion'),
+                const SizedBox(height: 12),
+                if (_videoTextureId == null)
+                  const Text('Texture not available')
+                else ...[
+                  Text('Texture ID: $_videoTextureId'),
+                  const SizedBox(height: 8),
+                  // Render the native GL video texture with flex to avoid overflow.
+                  Flexible(
+                    child: AspectRatio(
+                      aspectRatio: 16 / 9,
+                      child: Texture(textureId: _videoTextureId!),
+                    ),
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
         ),
       ),
