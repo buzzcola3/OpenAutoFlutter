@@ -20,4 +20,19 @@ class MethodChannelOpenautoflutter extends OpenautoflutterPlatform {
     final id = await methodChannel.invokeMethod<int>('getVideoTextureId');
     return id;
   }
+
+  @override
+  Future<void> sendTouchEvent({
+    required int pointerId,
+    required double x,
+    required double y,
+    required int actionCode,
+  }) async {
+    await methodChannel.invokeMethod<void>('sendTouchEvent', <String, dynamic>{
+      'pointerId': pointerId,
+      'x': x,
+      'y': y,
+      'action': actionCode,
+    });
+  }
 }

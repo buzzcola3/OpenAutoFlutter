@@ -30,4 +30,13 @@ abstract class OpenautoflutterPlatform extends PlatformInterface {
   Future<int?> getVideoTextureId() {
     throw UnimplementedError('getVideoTextureId() has not been implemented.');
   }
+
+  Future<void> sendTouchEvent({
+    required int pointerId,
+    required double x,
+    required double y,
+    required int actionCode,
+  }) {
+    throw UnimplementedError('sendTouchEvent() has not been implemented.');
+  }
 }

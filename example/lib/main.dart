@@ -19,6 +19,8 @@ class _MyAppState extends State<MyApp> {
   String _platformVersion = 'Unknown';
   final _openautoflutterPlugin = Openautoflutter();
   int? _videoTextureId;
+  final Set<int> _activePointers = <int>{};
+  Size? _textureSize;
 
   @override
   void initState() {
@@ -52,6 +54,44 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
+  void _sendTouch(PointerEvent event, TouchAction action) {
+    final size = _textureSize;
+    if (size == null || size.width == 0 || size.height == 0) return;
+
+    final double xNorm = (event.localPosition.dx / size.width).clamp(0.0, 1.0);
+    final double yNorm = (event.localPosition.dy / size.height).clamp(0.0, 1.0);
+
+    _openautoflutterPlugin.sendTouchEvent(
+      pointerId: event.pointer,
+      x: xNorm,
+      y: yNorm,
+      action: action,
+    );
+  }
+
+  void _handlePointerDown(PointerDownEvent event) {
+    final bool isFirst = _activePointers.isEmpty;
+    _activePointers.add(event.pointer);
+    _sendTouch(event, isFirst ? TouchAction.down : TouchAction.pointerDown);
+  }
+
+  void _handlePointerMove(PointerMoveEvent event) {
+    if (!_activePointers.contains(event.pointer)) return;
+    _sendTouch(event, TouchAction.moved);
+  }
+
+  void _handlePointerUp(PointerUpEvent event) {
+    final bool isLast = _activePointers.length <= 1;
+    _sendTouch(event, isLast ? TouchAction.up : TouchAction.pointerUp);
+    _activePointers.remove(event.pointer);
+  }
+
+  void _handlePointerCancel(PointerCancelEvent event) {
+    final bool isLast = _activePointers.length <= 1;
+    _sendTouch(event, isLast ? TouchAction.up : TouchAction.pointerUp);
+    _activePointers.remove(event.pointer);
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -75,9 +115,34 @@ class _MyAppState extends State<MyApp> {
                   const SizedBox(height: 8),
                   // Render the native GL video texture with flex to avoid overflow.
                   Flexible(
-                    child: AspectRatio(
-                      aspectRatio: 16 / 9,
-                      child: Texture(textureId: _videoTextureId!),
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final double maxWidth = constraints.maxWidth;
+                        final double maxHeight = constraints.maxHeight;
+                        const double aspect = 16 / 9;
+
+                        double width = maxWidth;
+                        double height = width / aspect;
+                        if (height > maxHeight) {
+                          height = maxHeight;
+                          width = height * aspect;
+                        }
+                        _textureSize = Size(width, height);
+
+                        return Center(
+                          child: SizedBox(
+                            width: width,
+                            height: height,
+                            child: Listener(
+                              onPointerDown: _handlePointerDown,
+                              onPointerMove: _handlePointerMove,
+                              onPointerUp: _handlePointerUp,
+                              onPointerCancel: _handlePointerCancel,
+                              child: Texture(textureId: _videoTextureId!),
+                            ),
+                          ),
+                        );
+                      },
                     ),
                   ),
                 ],

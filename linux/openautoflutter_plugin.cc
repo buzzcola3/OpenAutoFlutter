@@ -14,9 +14,11 @@
 #include <iostream>
 #include <iomanip>
 #include <memory>
+#include <algorithm>
 #include <mutex>
 #include <sstream>
 #include <vector>
+#include <string>
 
 using OATransport = buzz::autoapp::Transport::Transport;
 using OAMsgType = buzz::wire::MsgType;
@@ -36,6 +38,90 @@ std::string hex_head(const uint8_t* data, size_t size, size_t max_bytes = 32) {
   if (size > max_bytes) oss << " ...";
   return oss.str();
 }
+
+enum class TouchAction : uint32_t {
+  DOWN = 0,
+  UP = 1,
+  MOVED = 2,
+  POINTER_DOWN = 3,
+  POINTER_UP = 4,
+};
+
+struct TouchMessage {
+  float x;
+  float y;
+  uint32_t pointer_id;
+  uint32_t action;
+};
+
+static_assert(sizeof(TouchMessage) == 16, "TouchMessage layout unexpected");
+
+double get_number(FlValue* value, bool& ok) {
+  ok = false;
+  if (!value) return 0.0;
+  switch (fl_value_get_type(value)) {
+    case FL_VALUE_TYPE_INT:
+      ok = true;
+      return static_cast<double>(fl_value_get_int(value));
+    case FL_VALUE_TYPE_FLOAT:
+      ok = true;
+      return fl_value_get_float(value);
+    default:
+      return 0.0;
+  }
+}
+
+bool parse_touch_args(FlValue* args, TouchMessage& out, std::string& error) {
+  if (!args || fl_value_get_type(args) != FL_VALUE_TYPE_MAP) {
+    error = "Args must be a map";
+    return false;
+  }
+
+  bool ok = false;
+  const double x = get_number(fl_value_lookup_string(args, "x"), ok);
+  if (!ok) {
+    error = "Missing or invalid x";
+    return false;
+  }
+  const double y = get_number(fl_value_lookup_string(args, "y"), ok);
+  if (!ok) {
+    error = "Missing or invalid y";
+    return false;
+  }
+  const double pid_val = get_number(fl_value_lookup_string(args, "pointerId"), ok);
+  if (!ok) {
+    error = "Missing or invalid pointerId";
+    return false;
+  }
+  const double action_val = get_number(fl_value_lookup_string(args, "action"), ok);
+  if (!ok) {
+    error = "Missing or invalid action";
+    return false;
+  }
+
+  const int64_t action_i = static_cast<int64_t>(action_val);
+  TouchAction action_enum;
+  switch (action_i) {
+    case 0: action_enum = TouchAction::DOWN; break;
+    case 1: action_enum = TouchAction::UP; break;
+    case 2: action_enum = TouchAction::MOVED; break;
+    case 3: action_enum = TouchAction::POINTER_DOWN; break;
+    case 4: action_enum = TouchAction::POINTER_UP; break;
+    default:
+      error = "Unsupported action code";
+      return false;
+  }
+
+  const auto clamp01 = [](double v) {
+    return std::clamp(v, 0.0, 1.0);
+  };
+
+  out.x = static_cast<float>(clamp01(x));
+  out.y = static_cast<float>(clamp01(y));
+  out.pointer_id = pid_val < 0 ? 0u : static_cast<uint32_t>(pid_val);
+  out.action = static_cast<uint32_t>(action_enum);
+  return true;
+}
 } // namespace
 
 #define OPENAUTOFLUTTER_PLUGIN(obj) \
@@ -54,6 +140,8 @@ struct _OpenautoflutterPlugin {
     std::vector<uint8_t> yuv; // packed YUV420P [Y][U][V]
     int width = 0;
     int height = 0;
+    int64_t recv_ts_us = 0;   // when handler received packet
+    int64_t decode_ts_us = 0; // when decode completed
     bool has_new = false;
 
     std::atomic<int> log_count{0};
@@ -61,6 +149,9 @@ struct _OpenautoflutterPlugin {
     // Extract payload (optionally strip 8-byte ts + 4-byte payload header) and decode.
     void ingest_packet(const uint8_t* data, std::size_t size, H264Decoder& decoder) {
       if (!data || size == 0) return;
+
+      const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
 
       const uint8_t* payload = data;
       std::size_t payload_size = size;
@@ -115,11 +206,15 @@ struct _OpenautoflutterPlugin {
         }
         return;
       }
+      const auto decode_end_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
 
       std::lock_guard<std::mutex> lk(mutex);
       width = w;
       height = h;
       yuv.swap(decoded);
+      recv_ts_us = now_us;
+      decode_ts_us = decode_end_us;
       has_new = true;
       if (log_id < 8) {
         std::cout << "[VideoFrameState] decoded " << w << "x" << h
@@ -127,13 +222,17 @@ struct _OpenautoflutterPlugin {
       }
     }
 
-    bool take_latest(std::vector<uint8_t>& out, int& w, int& h) {
+    bool take_latest(std::vector<uint8_t>& out, int& w, int& h, int64_t& recv_us, int64_t& dec_us) {
       std::lock_guard<std::mutex> lk(mutex);
       if (!has_new || yuv.empty() || width <= 0 || height <= 0) return false;
       out = yuv; // copy to avoid holding lock during GL upload
       w = width;
       h = height;
+      recv_us = recv_ts_us;
+      dec_us = decode_ts_us;
       has_new = false;
+      recv_ts_us = 0;
+      decode_ts_us = 0;
       return true;
     }
   };
@@ -162,6 +261,21 @@ static void openautoflutter_plugin_handle_method_call(
     // Return the registered Flutter texture ID so Dart can render it via a Texture widget.
     g_autoptr(FlValue) result = fl_value_new_int(self->texture_id);
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
+  } else if (strcmp(method, "sendTouchEvent") == 0) {
+    TouchMessage touch_msg{};
+    std::string error;
+    if (!parse_touch_args(fl_method_call_get_args(method_call), touch_msg, error)) {
+      response = FL_METHOD_RESPONSE(fl_method_error_response_new("invalid_args", error.c_str(), nullptr));
+    } else {
+      const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (self->transport && self->transport->isRunning()) {
+        self->transport->send(OAMsgType::TOUCH, static_cast<uint64_t>(now_us), &touch_msg, sizeof(touch_msg));
+      } else {
+        g_warning("OAT: transport not running; dropping touch event");
+      }
+      response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+    }
   } else {
     response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
   }
@@ -247,7 +361,9 @@ static gboolean pump_video_frame_cb(gpointer user_data) {
 
   std::vector<uint8_t> frame;
   int w = 0, h = 0;
-  if (self->frame_state && self->frame_state->take_latest(frame, w, h)) {
+  int64_t recv_us = 0;
+  int64_t dec_us = 0;
+  if (self->frame_state && self->frame_state->take_latest(frame, w, h, recv_us, dec_us)) {
     const gsize need = static_cast<gsize>(w) * static_cast<gsize>(h) * 3u / 2u;
     if (frame.size() >= need) {
       oa_video_texture_set_yuv420p_frame(self->video_texture,
@@ -256,6 +372,21 @@ static gboolean pump_video_frame_cb(gpointer user_data) {
                                          w,
                                          h);
       oa_video_texture_mark_frame_available(self->video_texture, self->texture_registrar);
+
+      const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      const double decode_ms = dec_us > 0 && recv_us > 0 ? (dec_us - recv_us) / 1000.0 : -1.0;
+      const double upload_ms = dec_us > 0 ? (now_us - dec_us) / 1000.0 : -1.0;
+      const double total_ms = recv_us > 0 ? (now_us - recv_us) / 1000.0 : -1.0;
+
+      static int log_every = 60;
+      static int log_count = 0;
+      if ((log_count++ % log_every) == 0) {
+        std::cout << "[Timing] decode_ms=" << decode_ms
+                  << " upload_ms=" << upload_ms
+                  << " total_ms=" << total_ms
+                  << " size=" << w << "x" << h << std::endl;
+      }
     }
   }
   return TRUE; // continue calling
