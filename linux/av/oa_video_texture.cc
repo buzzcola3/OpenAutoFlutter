@@ -2,7 +2,10 @@
 
 #include <epoxy/gl.h>
 #include <flutter_linux/flutter_linux.h>
+#include <atomic>
+#include <iostream>
 #include <string.h>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -46,19 +49,53 @@ static GLuint compile_shader(GLenum type, const char* src) {
 	glShaderSource(s, 1, &src, nullptr);
 	glCompileShader(s);
 	GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[512];
+		GLsizei len = 0;
+		glGetShaderInfoLog(s, sizeof(log) - 1, &len, log);
+		std::cerr << "[OAVideoTexture][GL] shader compile failed: " << std::string(log, (size_t)len) << std::endl;
+		glDeleteShader(s);
+		return 0;
+	}
 	return s;
 }
 
-static GLuint create_yuv_program(GLint& loc_aPos, GLint& loc_aTex,
-								 GLint& loc_texY, GLint& loc_texU, GLint& loc_texV) {
-	// GLSL 120 for desktop OpenGL compatibility
-	static const char* vsrc =
+static void query_glsl_profile(bool& is_es, float& version) {
+	is_es = false;
+	version = 0.0f;
+	const char* sl = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
+	if (!sl) return;
+	is_es = (strstr(sl, "ES") != nullptr);
+	const char* p = sl;
+	while (*p && ((*p < '0' || *p > '9') && *p != '.')) {
+		++p;
+	}
+	if (*p) {
+		version = strtof(p, nullptr);
+	}
+}
+
+static bool log_gl_errors(const char* stage) {
+	bool had_error = false;
+	GLenum err = GL_NO_ERROR;
+	while ((err = glGetError()) != GL_NO_ERROR) {
+		had_error = true;
+		std::cerr << "[OAVideoTexture][GL] error 0x" << std::hex << err << std::dec << " at " << stage << std::endl;
+	}
+	return had_error;
+}
+
+static GLuint create_yuv_program(bool use_es,
+								   GLint& loc_aPos, GLint& loc_aTex,
+								   GLint& loc_texY, GLint& loc_texU, GLint& loc_texV) {
+	// Two shader variants: desktop GLSL 120 and GLES 100 (softpipe / ES contexts)
+	static const char* vsrc_desktop =
 		"#version 120\n"
 		"attribute vec2 aPos;\n"
 		"attribute vec2 aTex;\n"
 		"varying vec2 vTex;\n"
 		"void main(){ gl_Position=vec4(aPos,0.0,1.0); vTex=aTex; }\n";
-	static const char* fsrc =
+	static const char* fsrc_desktop =
 		"#version 120\n"
 		"varying vec2 vTex;\n"
 		"uniform sampler2D texY;\n"
@@ -74,14 +111,56 @@ static GLuint create_yuv_program(GLint& loc_aPos, GLint& loc_aTex,
 		"  gl_FragColor = vec4(r, g, b, 1.0);\n"
 		"}\n";
 
+	static const char* vsrc_es =
+		"#version 100\n"
+		"precision mediump float;\n"
+		"attribute vec2 aPos;\n"
+		"attribute vec2 aTex;\n"
+		"varying vec2 vTex;\n"
+		"void main(){ gl_Position=vec4(aPos,0.0,1.0); vTex=aTex; }\n";
+	static const char* fsrc_es =
+		"#version 100\n"
+		"precision mediump float;\n"
+		"varying vec2 vTex;\n"
+		"uniform sampler2D texY;\n"
+		"uniform sampler2D texU;\n"
+		"uniform sampler2D texV;\n"
+		"void main(){\n"
+		"  float y = texture2D(texY, vTex).r;\n"
+		"  float u = texture2D(texU, vTex).r - 0.5;\n"
+		"  float v = texture2D(texV, vTex).r - 0.5;\n"
+		"  float r = y + 1.402 * v;\n"
+		"  float g = y - 0.344136 * u - 0.714136 * v;\n"
+		"  float b = y + 1.772 * u;\n"
+		"  gl_FragColor = vec4(r, g, b, 1.0);\n"
+		"}\n";
+
+	const char* vsrc = use_es ? vsrc_es : vsrc_desktop;
+	const char* fsrc = use_es ? fsrc_es : fsrc_desktop;
+
 	GLuint vs = compile_shader(GL_VERTEX_SHADER, vsrc);
 	GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fsrc);
+	if (vs == 0 || fs == 0) {
+		if (vs) glDeleteShader(vs);
+		if (fs) glDeleteShader(fs);
+		return 0;
+	}
+
 	GLuint prog = glCreateProgram();
 	glAttachShader(prog, vs);
 	glAttachShader(prog, fs);
 	glLinkProgram(prog);
 	glDeleteShader(vs);
 	glDeleteShader(fs);
+	GLint linked = 0; glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+	if (!linked) {
+		char log[512];
+		GLsizei len = 0;
+		glGetProgramInfoLog(prog, sizeof(log) - 1, &len, log);
+		std::cerr << "[OAVideoTexture][GL] program link failed: " << std::string(log, (size_t)len) << std::endl;
+		glDeleteProgram(prog);
+		return 0;
+	}
 	loc_aPos  = glGetAttribLocation(prog, "aPos");
 	loc_aTex  = glGetAttribLocation(prog, "aTex");
 	loc_texY  = glGetUniformLocation(prog, "texY");
@@ -121,11 +200,46 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 	const int expected = cur_w * cur_h * 4;
 	const gboolean have_rgba = (self->pixels != nullptr && cur_w > 0 && cur_h > 0 && (int)self->pixels->len >= expected);
 	const gboolean have_yuv  = (self->has_yuv && self->yuv != nullptr && cur_w > 0 && cur_h > 0);
+	static std::atomic<int> frame_counter{0};
+	static bool logged_fallback = false;
+	bool is_es = false;
+	float glsl_version = 0.0f;
+	query_glsl_profile(is_es, glsl_version);
+	const bool es2_profile = is_es && glsl_version > 0.0f && glsl_version < 3.0f;
+	const bool use_luminance = es2_profile;
+	const bool use_es_shaders = is_es; // Prefer ES shaders whenever GL reports ES
+
+	auto fallback = [&]() {
+		glTexImage2D(GL_TEXTURE_2D,
+					 0,
+					 GL_RGBA8,
+					 1,
+					 1,
+					 0,
+					 GL_RGBA,
+					 GL_UNSIGNED_BYTE,
+					 (const unsigned char[4]){0xFF, 0x00, 0x00, 0xFF});
+		*width = 1;
+		*height = 1;
+		if (!logged_fallback) {
+			std::cout << "[OAVideoTexture] Using 1x1 fallback texture (no frame data yet)" << std::endl;
+			logged_fallback = true;
+		}
+	};
 
 	if (have_yuv) {
+		bool ok = true;
 		// Lazy-init GL resources
 		if (self->program == 0) {
-			self->program = create_yuv_program(self->loc_aPos, self->loc_aTex, self->loc_texY, self->loc_texU, self->loc_texV);
+			self->program = create_yuv_program(use_es_shaders, self->loc_aPos, self->loc_aTex, self->loc_texY, self->loc_texU, self->loc_texV);
+			if (self->program == 0) {
+				ok = false;
+			}
+		}
+		if (!ok) {
+			lk.unlock();
+			fallback();
+			goto populate_done;
 		}
 		if (self->vbo == 0) {
 			const GLfloat quad[] = {
@@ -164,21 +278,45 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 
 		// Upload planes as single-channel textures (GL_LUMINANCE for broad compat)
 	glBindTexture(GL_TEXTURE_2D, self->y_tex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, cur_w, cur_h, 0, GL_RED, GL_UNSIGNED_BYTE, y_ptr);
+	glTexImage2D(GL_TEXTURE_2D,
+			 0,
+			 use_luminance ? GL_LUMINANCE : GL_R8,
+			 cur_w,
+			 cur_h,
+			 0,
+			 use_luminance ? GL_LUMINANCE : GL_RED,
+			 GL_UNSIGNED_BYTE,
+			 y_ptr);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 	glBindTexture(GL_TEXTURE_2D, self->u_tex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_w, uv_h, 0, GL_RED, GL_UNSIGNED_BYTE, u_ptr);
+	glTexImage2D(GL_TEXTURE_2D,
+			 0,
+			 use_luminance ? GL_LUMINANCE : GL_R8,
+			 uv_w,
+			 uv_h,
+			 0,
+			 use_luminance ? GL_LUMINANCE : GL_RED,
+			 GL_UNSIGNED_BYTE,
+			 u_ptr);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 	glBindTexture(GL_TEXTURE_2D, self->v_tex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, uv_w, uv_h, 0, GL_RED, GL_UNSIGNED_BYTE, v_ptr);
+	glTexImage2D(GL_TEXTURE_2D,
+			 0,
+			 use_luminance ? GL_LUMINANCE : GL_R8,
+			 uv_w,
+			 uv_h,
+			 0,
+			 use_luminance ? GL_LUMINANCE : GL_RED,
+			 GL_UNSIGNED_BYTE,
+			 v_ptr);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -207,6 +345,7 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 		glVertexAttribPointer(self->loc_aTex, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)(2 * sizeof(GLfloat)));
 
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		ok = !log_gl_errors("yuv_draw");
 
 		// (no debug dumping)
 
@@ -217,9 +356,19 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 		glUseProgram(0);
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-		*width = (uint32_t)cur_w;
-		*height = (uint32_t)cur_h;
-		lk.unlock();
+		if (!ok) {
+			lk.unlock();
+			fallback();
+		} else {
+			*width = (uint32_t)cur_w;
+			*height = (uint32_t)cur_h;
+			int count = ++frame_counter;
+			if (count <= 5 || count % 120 == 0) {
+				std::cout << "[OAVideoTexture] YUV frame -> GL " << cur_w << "x" << cur_h << " (" << count << ")" << std::endl;
+			}
+			logged_fallback = false;
+			lk.unlock();
+		}
 	} else if (have_rgba) {
 		glTexImage2D(GL_TEXTURE_2D,
 					 0,
@@ -234,26 +383,21 @@ static gboolean oa_video_texture_populate(FlTextureGL* texture,
 		// (no debug dumping)
 		*width = (uint32_t)cur_w;
 		*height = (uint32_t)cur_h;
+		int count = ++frame_counter;
+		if (count <= 5 || count % 120 == 0) {
+			std::cout << "[OAVideoTexture] RGBA frame -> GL " << cur_w << "x" << cur_h << " (" << count << ")" << std::endl;
+		}
+		logged_fallback = false;
 		lk.unlock();
 	} else {
 		lk.unlock();
-		// Fallback: ensure at least 1px renders
-		static const unsigned char one_px[4] = { 0xFF, 0x00, 0x00, 0xFF }; // Red
-		glTexImage2D(GL_TEXTURE_2D,
-					 0,
-					 GL_RGBA8,
-					 1,
-					 1,
-					 0,
-					 GL_RGBA,
-					 GL_UNSIGNED_BYTE,
-					 one_px);
-		*width = 1;
-		*height = 1;
+		fallback();
 	}
 
 	*target = GL_TEXTURE_2D;
 	*name = self->gl_tex;
+
+populate_done:
 	return TRUE;
 }
 

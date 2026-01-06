@@ -10,6 +10,8 @@
 #include <cstring>
 #include <vector>
 #include <mutex>
+#include <sstream>
+#include <iomanip>
 
 #include "h264_decoder.h"
 
@@ -28,6 +30,17 @@ struct AVConsumer::Impl {
 	std::mutex frameMutex;
 	bool newFrameAvailable = false;
 
+	static std::string hex_head(const unsigned char* data, size_t size, size_t max_bytes = 32) {
+		std::ostringstream oss;
+		const size_t n = std::min(size, max_bytes);
+		for (size_t i = 0; i < n; ++i) {
+			if (i) oss << ' ';
+			oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[i]);
+		}
+		if (size > max_bytes) oss << " ...";
+		return oss.str();
+	}
+
 	void start() {
 		const std::string videoShm = "/openauto_video_shm";
 		const std::string videoSem = "/openauto_video_shm_sem";
@@ -37,6 +50,7 @@ struct AVConsumer::Impl {
 		const std::string audioSem = "/openauto_audio_shm_sem";
 		const size_t audioSize = 8192+12;
 
+		static std::atomic<int> video_pkt_counter{0};
 		videoConsumer = std::make_unique<SharedMemoryConsumer>(
 			videoShm, videoSem, videoSize,
 			[this](const unsigned char* buffer, size_t size) {
@@ -51,7 +65,12 @@ struct AVConsumer::Impl {
 				std::memcpy(&payload, buffer + sizeof(uint64_t), sizeof(uint32_t));
 				const uint8_t* h264 = buffer + header;
 				const size_t h264_size = size - header;
-				//std::cout << "[AVConsumer] Video timestamp=" << ts << ", payloadSize=" << payload << std::endl;
+				int pkt_id = ++video_pkt_counter;
+				if (pkt_id <= 10) {
+					std::cout << "[AVConsumer] pkt=" << pkt_id << " ts=" << ts << " size=" << size
+						<< " payload=" << payload << " h264=" << h264_size
+						<< " head=" << hex_head(h264, h264_size, 32) << std::endl;
+				}
 
 				// Decode to YUV420P and store
 				int w=0,h=0; std::vector<uint8_t> yuv;
