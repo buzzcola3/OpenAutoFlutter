@@ -2,26 +2,22 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "flutter build linux (example)",
+      "label": "docker: build builder image",
       "type": "shell",
-      "command": "flutter",
-      "args": ["build", "linux", "-v"],
+      "command": "docker build -t openautoflutter-builder .",
       "options": {
-        "cwd": "${workspaceFolder}/example"
-      },
-      "group": {
-        "kind": "build",
-        "isDefault": true
+        "cwd": "${workspaceFolder}"
       },
       "problemMatcher": []
     },
     {
-      "label": "flutter clean (example)",
+      "label": "docker: flutter build linux (example)",
       "type": "shell",
-      "command": "flutter",
-      "args": ["clean"],
-      "options": {
-        "cwd": "${workspaceFolder}/example"
+      "command": "docker run --rm -t -v \"${workspaceFolder}:/workspace\" -w /workspace/example openautoflutter-builder flutter build linux -v",
+      "dependsOn": "docker: build builder image",
+      "group": {
+        "kind": "build",
+        "isDefault": true
       },
       "problemMatcher": []
     }

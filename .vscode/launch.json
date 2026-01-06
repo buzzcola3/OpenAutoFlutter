@@ -2,22 +2,29 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Flutter: Debug example (Linux)",
+      "name": "Debug openautoflutter_example (gdb)",
+      "type": "cppdbg",
       "request": "launch",
-      "type": "dart",
-      "program": "${workspaceFolder}/example/lib/main.dart",
-      "cwd": "${workspaceFolder}/example",
-      "deviceId": "linux",
-      "flutterMode": "debug"
-    },
-    {
-      "name": "Flutter: Profile example (Linux)",
-      "request": "launch",
-      "type": "dart",
-      "program": "${workspaceFolder}/example/lib/main.dart",
-      "cwd": "${workspaceFolder}/example",
-      "deviceId": "linux",
-      "flutterMode": "profile"
+      "program": "${workspaceFolder}/example/build/linux/x64/release/bundle/openautoflutter_example",
+      "args": [],
+      "cwd": "${workspaceFolder}/example/build/linux/x64/release/bundle",
+      "environment": [
+        {
+          "name": "LD_LIBRARY_PATH",
+          "value": "${workspaceFolder}/example/build/linux/x64/release/bundle/lib"
+        }
+      ],
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "text": "-enable-pretty-printing",
+          "description": "Enable pretty-printing for gdb"
+        }
+      ],
+      "preLaunchTask": "docker: flutter build linux (example)",
+      "externalConsole": false
     }
   ]
 }
