@@ -72,8 +72,8 @@ set_target_properties(${BINARY_NAME}
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/intermediates_do_not_run"
 )
 
-# Enable the test target.
-set(include_openautoflutter_tests TRUE)
+# Disable plugin unit tests in example builds to avoid pulling gtest when not needed.
+set(include_openautoflutter_tests FALSE)
 
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
